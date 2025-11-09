@@ -73,3 +73,4 @@ npm run dev
 - **Claude API errors**: Verify your API key is correct and has credits
 - **Shopify API errors**: Check that your app has the required scopes enabled
 
+

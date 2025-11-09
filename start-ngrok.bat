@@ -8,3 +8,4 @@ echo Also update Shopify app redirect URL to: <your-ngrok-url>/auth/callback
 echo.
 ngrok http 8000
 
+

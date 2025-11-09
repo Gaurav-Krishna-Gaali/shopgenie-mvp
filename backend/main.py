@@ -1,5 +1,5 @@
 import os, json, time, hmac, base64, hashlib, sqlite3
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
@@ -17,9 +17,15 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
 
 app = FastAPI()
 
+# CORS configuration - use FRONTEND_URL in production, allow all in development
+cors_origins = [FRONTEND_URL] if FRONTEND_URL and FRONTEND_URL != "http://localhost:3000" and FRONTEND_URL != "http://127.0.0.1:3000" else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 def db():
@@ -45,7 +51,7 @@ async def install(shop: str):
     # If you get "requires merchant approval" errors, re-install the app to get fresh approval
     # Required scopes: read_products (view products), write_products (edit products), 
     # read_content, write_content, write_discounts
-    scopes = "read_products,write_products,read_content,write_content,write_discounts"
+    scopes = "read_products,write_products,read_content,write_content,write_discounts,read_themes,write_themes"
     redirect_uri = f"{APP_URL}/auth/callback"
     state = "nonce123"  # add a real nonce in production
     q = urlencode({
@@ -612,6 +618,330 @@ async def create_bundle(data: dict):
         raise HTTPException(504, "Request to Shopify API timed out. The bundle may have been created. Please check your Shopify admin.")
     except httpx.RequestError as e:
         raise HTTPException(500, f"Network error connecting to Shopify API: {str(e)}")
+
+@app.post("/api/generate-announcement")
+async def generate_announcement(data: dict):
+    """Generate an announcement bar snippet using Claude AI"""
+    shop = data["shop"]
+    prompt = data["prompt"]
+    
+    c = db()
+    row = c.execute("SELECT * FROM shops WHERE shop = ?", (shop,)).fetchone()
+    if not row:
+        raise HTTPException(401, "Not connected")
+    
+    AI_PROMPT = f"""You are a Shopify Theme UI expert.
+
+Generate an announcement bar snippet based on this request:
+
+"{prompt}"
+
+Return ONLY valid JSON (no markdown, no code fences, no explanations):
+
+{{
+  "filename": "ai-announcement-bar.liquid",
+  "content": "<div style='background: #000; color: #fff; padding: 12px; text-align: center;'>Your message here</div>",
+  "preview_html": "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body><div style='background: #000; color: #fff; padding: 12px; text-align: center;'>Your message here</div></body></html>"
+}}
+
+CRITICAL RULES:
+- Return ONLY the JSON object, nothing else
+- Properly escape all quotes in HTML strings using backslashes
+- Keep the content field concise but complete
+- The preview_html should be a complete standalone HTML document
+- Ensure all strings are properly closed
+- Do not use markdown code blocks
+"""
+    
+    headers = {
+        "x-api-key": CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+    
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 2000,
+        "messages": [{"role": "user", "content": AI_PROMPT}]
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            res = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload
+            )
+            res.raise_for_status()
+            response_data = res.json()
+    except httpx.HTTPStatusError as e:
+        error_detail = f"Claude API error: {e.response.status_code}"
+        if e.response.status_code == 401:
+            error_detail = "Invalid Claude API key. Please check your CLAUDE_API_KEY in .env file."
+        try:
+            error_data = e.response.json()
+            if "error" in error_data:
+                error_detail = error_data["error"].get("message", error_detail)
+        except:
+            error_detail = f"{error_detail} - Response: {e.response.text[:200]}"
+        raise HTTPException(500, f"AI generation failed: {error_detail}") from e
+    except httpx.RequestError as e:
+        raise HTTPException(500, f"Network error connecting to Claude API: {str(e)}")
+    
+    content_blocks = response_data.get("content", [])
+    if not content_blocks or len(content_blocks) == 0:
+        raise HTTPException(500, "Claude API returned empty response")
+    
+    text = content_blocks[0].get("text", "").strip()
+    if not text:
+        raise HTTPException(500, "Claude API returned empty text content")
+    
+    # Check if response was truncated
+    stop_reason = response_data.get("stop_reason", "")
+    if stop_reason == "max_tokens":
+        raise HTTPException(500, "Response was truncated. Please try a shorter prompt or simpler design.")
+    
+    # Clean up code fences and markdown
+    text = text.strip()
+    # Remove markdown code blocks
+    if text.startswith("```"):
+        # Find the first newline after ```
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            text = text[first_newline:].strip()
+        if text.endswith("```"):
+            text = text[:-3].strip()
+    # Remove any leading "json" keyword
+    if text.lower().startswith("json"):
+        text = text[4:].strip()
+    
+    # Try to extract JSON if there's extra text
+    # Look for the first { and last }
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        text = text[first_brace:last_brace + 1]
+    
+    try:
+        announcement = json.loads(text)
+        # Validate required fields
+        if "filename" not in announcement or "content" not in announcement or "preview_html" not in announcement:
+            raise ValueError("Missing required fields: filename, content, or preview_html")
+        return announcement
+    except json.JSONDecodeError as e:
+        # Try to provide more helpful error message
+        error_pos = getattr(e, 'pos', None)
+        if error_pos:
+            context_start = max(0, error_pos - 100)
+            context_end = min(len(text), error_pos + 100)
+            context = text[context_start:context_end]
+            raise HTTPException(500, f"Claude returned invalid JSON at position {error_pos}: {str(e)}. Context: ...{context}...")
+        raise HTTPException(500, f"Claude returned invalid JSON: {str(e)}. Response preview: {text[:500]}")
+    except ValueError as e:
+        raise HTTPException(500, f"Invalid response format: {str(e)}")
+
+@app.post("/api/publish-announcement")
+async def publish_announcement(data: dict):
+    """Publish the announcement bar snippet to Shopify"""
+    shop = data["shop"]
+    filename = data["filename"]
+    content = data["content"]
+    
+    c = db()
+    row = c.execute("SELECT * FROM shops WHERE shop = ?", (shop,)).fetchone()
+    if not row:
+        raise HTTPException(401, "Not connected")
+    token = row["access_token"]
+    
+    # Find main theme - try older API versions that allow asset modifications
+    # Try 2022-10 first (more permissive), fallback to 2023-01
+    api_versions = ["2022-10", "2023-01"]
+    themes_data = None
+    working_version = None
+    
+    async with httpx.AsyncClient() as client:
+        for api_version in api_versions:
+            themes = await client.get(
+                f"https://{shop}/admin/api/{api_version}/themes.json",
+                headers=shopify_headers(token)
+            )
+            if themes.status_code == 200:
+                themes_data = themes.json()
+                working_version = api_version
+                break
+        if themes_data is None:
+            raise HTTPException(400, f"Failed to fetch themes with any API version. Tried: {', '.join(api_versions)}")
+    
+    theme_id = next((t for t in themes_data["themes"] if t["role"] == "main"), None)
+    if not theme_id:
+        raise HTTPException(400, "Main theme not found")
+    theme_id = theme_id["id"]
+    
+    payload = {
+        "asset": {
+            "key": f"snippets/{filename}",
+            "value": content
+        }
+    }
+    
+    async with httpx.AsyncClient() as client:
+        up = await client.put(
+            f"https://{shop}/admin/api/{working_version}/themes/{theme_id}/assets.json",
+            headers=shopify_headers(token),
+            json=payload
+        )
+        if up.status_code not in (200, 201):
+            error_msg = up.text
+            raise HTTPException(400, f"Failed to publish snippet (Status {up.status_code}): {error_msg}")
+    
+    return {"ok": True, "theme_id": theme_id}
+
+@app.post("/api/inject-announcement")
+async def inject_announcement(data: dict):
+    """Inject the announcement bar snippet into theme.liquid"""
+    shop = data["shop"]
+    filename = data["filename"]  # ai-announcement-bar.liquid
+    
+    c = db()
+    row = c.execute("SELECT * FROM shops WHERE shop = ?", (shop,)).fetchone()
+    if not row:
+        raise HTTPException(401, "Not connected")
+    token = row["access_token"]
+    
+    # Fetch theme list - try older API versions that allow asset modifications
+    api_versions = ["2022-10", "2023-01"]
+    themes_data = None
+    working_version = None
+    
+    async with httpx.AsyncClient() as client:
+        for api_version in api_versions:
+            themes = await client.get(
+                f"https://{shop}/admin/api/{api_version}/themes.json",
+                headers=shopify_headers(token)
+            )
+            if themes.status_code == 200:
+                themes_data = themes.json()
+                working_version = api_version
+                break
+        
+        if themes_data is None:
+            raise HTTPException(400, f"Failed to fetch themes with any API version. Tried: {', '.join(api_versions)}")
+    
+    theme_id = next((t for t in themes_data["themes"] if t["role"] == "main"), None)
+    if not theme_id:
+        raise HTTPException(400, "Main theme not found")
+    theme_id = theme_id["id"]
+    
+    # Fetch theme.liquid - try common layout file names
+    layout_candidates = ["layout/theme.liquid", "layout/theme", "templates/theme.liquid", "templates/theme", "theme.liquid", "theme"]
+    layout_key = None
+    content = None
+    
+    async with httpx.AsyncClient() as client:
+        # First, try direct lookup for each candidate
+        for candidate in layout_candidates:
+            query_params = urlencode({"asset[key]": candidate})
+            tl = await client.get(
+                f"https://{shop}/admin/api/{working_version}/themes/{theme_id}/assets.json?{query_params}",
+                headers=shopify_headers(token)
+            )
+            if tl.status_code == 200:
+                asset_data = tl.json()
+                # Verify we got the asset with the right key
+                if "asset" in asset_data:
+                    asset_key = asset_data["asset"].get("key")
+                    if asset_key == candidate or asset_key.endswith("/theme.liquid") or asset_key.endswith("/theme"):
+                        content = asset_data["asset"]["value"]
+                        layout_key = asset_key  # Use the exact key from response
+                        break
+        
+        # If not found, try listing all assets to find the main layout
+        if layout_key is None:
+            all_assets = await client.get(
+                f"https://{shop}/admin/api/{working_version}/themes/{theme_id}/assets.json",
+                headers=shopify_headers(token)
+            )
+            if all_assets.status_code == 200:
+                assets_data = all_assets.json()
+                # Look for theme.liquid in layout or templates folder
+                for asset in assets_data.get("assets", []):
+                    key = asset.get("key", "")
+                    if key in ["layout/theme.liquid", "layout/theme", "templates/theme.liquid", "templates/theme"]:
+                        # Fetch the full content
+                        query_params = urlencode({"asset[key]": key})
+                        asset_resp = await client.get(
+                            f"https://{shop}/admin/api/{working_version}/themes/{theme_id}/assets.json?{query_params}",
+                            headers=shopify_headers(token)
+                        )
+                        if asset_resp.status_code == 200:
+                            asset_data = asset_resp.json()
+                            content = asset_data["asset"]["value"]
+                            layout_key = key
+                            break
+        
+        if layout_key is None or content is None:
+            raise HTTPException(404, f"Could not find theme layout file. Please ensure your theme has a layout/theme.liquid file.")
+    
+    # Remove .liquid extension for render tag
+    snippet_name = filename.replace(".liquid", "")
+    render_snippet = f"{{% render '{snippet_name}' %}}"
+    
+    if render_snippet in content:
+        return {"ok": True, "message": "Already injected"}
+    
+    # Inject after <body> tag
+    if "<body" in content:
+        before, rest = content.split("<body", 1)
+        pos = rest.find(">") + 1
+        new_content = (
+            before + "<body" + rest[:pos] + "\n  " + render_snippet + "\n" + rest[pos:]
+        )
+    else:
+        new_content = render_snippet + "\n" + content
+    
+    payload = {
+        "asset": {
+            "key": layout_key,
+            "value": new_content
+        }
+    }
+    
+    # Debug: log what we're trying to update
+    print(f"Attempting to update theme asset: theme_id={theme_id}, key={layout_key}")
+    
+    async with httpx.AsyncClient() as client:
+        up = await client.put(
+            f"https://{shop}/admin/api/{working_version}/themes/{theme_id}/assets.json",
+            headers=shopify_headers(token),
+            json=payload
+        )
+        if up.status_code not in (200, 201):
+            error_msg = up.text
+            print(f"PUT request failed: Status {up.status_code}, Response: {error_msg}")
+            print(f"Payload key: {layout_key}, Theme ID: {theme_id}, API Version: {working_version}")
+            
+            # Provide helpful error message
+            if up.status_code == 404:
+                detailed_error = f"""Theme asset modification failed (404). 
+
+This may be due to Shopify's restrictions on modifying theme assets via API.
+
+SOLUTIONS:
+1. The snippet has been created successfully. You can manually add this line to your theme.liquid file:
+   {render_snippet}
+   Add it right after the <body> tag.
+
+2. Or request a theme modification exemption from Shopify (takes ~15 days).
+
+3. Try using a development theme instead of the published theme.
+
+Snippet location: snippets/{filename}
+Layout file: {layout_key}"""
+                raise HTTPException(400, detailed_error)
+            else:
+                raise HTTPException(400, f"Failed to inject into theme (Status {up.status_code}): {error_msg}")
+    
+    return {"ok": True}
 
 if __name__ == "__main__":
     import uvicorn

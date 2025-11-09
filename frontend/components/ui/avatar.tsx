@@ -1,12 +1,16 @@
 import * as React from "react"
+import { cn } from "@/lib/utils"
 
 const Avatar = React.forwardRef<
   HTMLDivElement,
   React.HTMLAttributes<HTMLDivElement> & { src?: string; alt?: string }
->(({ className = "", src, alt, children, ...props }, ref) => (
+>(({ className, src, alt, children, ...props }, ref) => (
   <div
     ref={ref}
-    className={`relative flex h-10 w-10 shrink-0 overflow-hidden rounded-full ${className}`}
+    className={cn(
+      "relative flex h-10 w-10 shrink-0 overflow-hidden rounded-full",
+      className
+    )}
     {...props}
   >
     {src ? (

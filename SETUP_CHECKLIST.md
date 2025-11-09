@@ -50,3 +50,4 @@
   4. Apply to store
   5. Shopify Admin showing updated product and discount
 
+
