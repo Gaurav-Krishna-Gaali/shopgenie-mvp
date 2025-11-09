@@ -344,6 +344,275 @@ async def apply_changes(data: dict):
     c.commit()
     return {"ok": True}
 
+@app.post("/api/generate-bundle")
+async def generate_bundle(data: dict):
+    shop = data["shop"]
+    product_a_id = data["product_a_id"]
+    product_b_id = data["product_b_id"]
+
+    c = db()
+    row = c.execute("SELECT * FROM shops WHERE shop = ?", (shop,)).fetchone()
+    if not row:
+        raise HTTPException(401, "Not connected")
+    token = row["access_token"]
+
+    async with httpx.AsyncClient() as client:
+        pa = await client.get(
+            f"https://{shop}/admin/api/2024-10/products/{product_a_id}.json",
+            headers=shopify_headers(token)
+        )
+        pb = await client.get(
+            f"https://{shop}/admin/api/2024-10/products/{product_b_id}.json",
+            headers=shopify_headers(token)
+        )
+
+    if pa.status_code != 200:
+        error_msg = pa.text
+        print(f"Shopify API Error ({pa.status_code}): {error_msg}")
+        raise HTTPException(400, f"Failed to fetch product A (Status {pa.status_code}): {error_msg}")
+    if pb.status_code != 200:
+        error_msg = pb.text
+        print(f"Shopify API Error ({pb.status_code}): {error_msg}")
+        raise HTTPException(400, f"Failed to fetch product B (Status {pb.status_code}): {error_msg}")
+
+    product_a = pa.json()["product"]
+    product_b = pb.json()["product"]
+
+    # Build prompt
+    PROMPT = f"""
+You are a Shopify ecommerce expert.
+
+Here are two products in JSON:
+
+Product A:
+{json.dumps(product_a)[:6000]}
+
+Product B:
+{json.dumps(product_b)[:6000]}
+
+Create a NEW Shopify bundle product.
+
+Return ONLY valid JSON with no explanation:
+{{
+  "title": "...",
+  "description_html": "...",
+  "tags": "...",
+  "bundle_price_percent_off": 10,
+  "bundle_notes": "..."
+}}
+    """
+
+    headers = {
+        "x-api-key": CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 800,
+        "messages": [{"role": "user", "content": PROMPT}]
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload
+            )
+            r.raise_for_status()
+            response_data = r.json()
+    except httpx.HTTPStatusError as e:
+        error_detail = f"Claude API error: {e.response.status_code}"
+        if e.response.status_code == 401:
+            error_detail = "Invalid Claude API key. Please check your CLAUDE_API_KEY in .env file."
+        elif e.response.status_code == 404:
+            error_detail = "Claude API endpoint not found (404). Please verify your API key and endpoint are correct."
+        elif e.response.status_code == 429:
+            error_detail = "Claude API rate limit exceeded. Please try again later."
+        try:
+            error_data = e.response.json()
+            if "error" in error_data:
+                error_detail = error_data["error"].get("message", error_detail)
+        except:
+            error_detail = f"{error_detail} - Response: {e.response.text[:200]}"
+        raise HTTPException(500, f"AI generation failed: {error_detail}") from e
+    except httpx.RequestError as e:
+        raise HTTPException(500, f"Network error connecting to Claude API: {str(e)}") from e
+    
+    # Claude response format: content is an array of text blocks
+    content_blocks = response_data.get("content", [])
+    if not content_blocks or len(content_blocks) == 0:
+        raise HTTPException(500, "Claude API returned empty response")
+    
+    text = content_blocks[0].get("text", "").strip()
+    if not text:
+        raise HTTPException(500, "Claude API returned empty text content")
+    
+    # be resilient if model returns code fences
+    text = text.strip().strip("`")
+    if text.startswith("json"): 
+        text = text[4:].strip()
+    if text.startswith("```json"):
+        text = text[7:].strip()
+    if text.endswith("```"):
+        text = text[:-3].strip()
+
+    try:
+        bundle_data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise HTTPException(500, f"Claude returned invalid JSON: {str(e)}. Response: {text[:200]}")
+    return {
+        "product_a": product_a,
+        "product_b": product_b,
+        "bundle": bundle_data
+    }
+
+@app.post("/api/agent-intent")
+async def agent_intent(data: dict):
+    """Understand user intent from natural language prompt"""
+    user_prompt = data.get("prompt", "").lower()
+    
+    # Simple intent detection (can be enhanced with Claude if needed)
+    intent = {
+        "action": "unknown",
+        "show_section": None,
+        "message": "I'm here to help! What would you like to do?"
+    }
+    
+    if any(word in user_prompt for word in ["bundle", "combine", "pair", "group products"]):
+        intent = {
+            "action": "bundle",
+            "show_section": "bundle",
+            "message": "Great! I'll help you create a bundle. Select two products below to get started."
+        }
+    elif any(word in user_prompt for word in ["description", "desc", "launch", "optimize", "generate", "assets", "title", "seo"]):
+        intent = {
+            "action": "optimize",
+            "show_section": "optimize",
+            "message": "Perfect! I'll help you optimize your product descriptions and launch assets. Select a product below to generate optimized content."
+        }
+    elif any(word in user_prompt for word in ["product", "list", "show", "view", "see"]):
+        intent = {
+            "action": "list",
+            "show_section": "products",
+            "message": "I'll load your products for you."
+        }
+    elif any(word in user_prompt for word in ["help", "what can", "how", "guide"]):
+        intent = {
+            "action": "help",
+            "show_section": None,
+            "message": "I can help you with:\n• Creating product bundles - just say 'I want to bundle something'\n• Optimizing product descriptions - say 'I want to change descriptions'\n• Generating launch assets - select a product and I'll create optimized content\n\nWhat would you like to do?"
+        }
+    
+    return intent
+
+@app.post("/api/create-bundle")
+async def create_bundle(data: dict):
+    shop = data["shop"]
+    product_a = data["product_a"]
+    product_b = data["product_b"]
+    bundle = data["bundle"]
+
+    c = db()
+    row = c.execute("SELECT * FROM shops WHERE shop = ?", (shop,)).fetchone()
+    if not row:
+        raise HTTPException(401, "Not connected")
+    token = row["access_token"]
+
+    # Calculate bundle price
+    price_a = float(product_a["variants"][0]["price"])
+    price_b = float(product_b["variants"][0]["price"])
+    discount = bundle["bundle_price_percent_off"] / 100
+    bundle_price = round((price_a + price_b) * (1 - discount), 2)
+
+    # Collect images from both products
+    images = []
+    # Add first image from Product A if available
+    if product_a.get("images") and len(product_a["images"]) > 0:
+        images.append({"src": product_a["images"][0]["src"]})
+    # Add first image from Product B if available
+    if product_b.get("images") and len(product_b["images"]) > 0:
+        images.append({"src": product_b["images"][0]["src"]})
+
+    # Create product payload without metafields (they'll be added separately)
+    payload = {
+        "product": {
+            "title": bundle["title"],
+            "body_html": bundle["description_html"],
+            "tags": bundle["tags"],
+            "product_type": "Bundle",
+            "variants": [
+                {
+                    "title": "Bundle Default",
+                    "price": str(bundle_price)
+                }
+            ],
+            "images": images
+        }
+    }
+    
+    # Prepare metafield data for separate creation
+    metafield_data = {
+        "namespace": "bundle",
+        "key": "components",
+        "type": "json",
+        "value": json.dumps({
+            "product_a_id": product_a["id"],
+            "product_b_id": product_b["id"],
+            "notes": bundle["bundle_notes"]
+        })
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(
+                f"https://{shop}/admin/api/2024-10/products.json",
+                headers=shopify_headers(token),
+                json=payload
+            )
+            if r.status_code not in (200, 201):
+                error_msg = r.text
+                print(f"Shopify API Error ({r.status_code}): {error_msg}")
+                raise HTTPException(400, f"Bundle creation failed (Status {r.status_code}): {error_msg}")
+            
+            created_product = r.json()
+            
+            # Create metafields separately after product creation
+            if created_product.get("product"):
+                product_id = created_product["product"]["id"]
+                
+                try:
+                    metafield_payload = {
+                        "metafield": {
+                            "namespace": metafield_data["namespace"],
+                            "key": metafield_data["key"],
+                            "type": metafield_data["type"],
+                            "value": metafield_data["value"],
+                            "owner_resource": "product",
+                            "owner_id": product_id
+                        }
+                    }
+                    async with httpx.AsyncClient(timeout=60.0) as metafield_client:
+                        mf_r = await metafield_client.post(
+                            f"https://{shop}/admin/api/2024-10/metafields.json",
+                            headers=shopify_headers(token),
+                            json=metafield_payload
+                        )
+                        if mf_r.status_code not in (200, 201):
+                            print(f"Warning: Metafield creation failed ({mf_r.status_code}): {mf_r.text}")
+                            # Don't fail the whole request if metafield creation fails
+                except Exception as e:
+                    print(f"Warning: Could not create metafield: {str(e)}")
+                    # Don't fail the whole request if metafield creation fails
+            
+            return {"created_product": created_product}
+    except httpx.ReadTimeout:
+        raise HTTPException(504, "Request to Shopify API timed out. The bundle may have been created. Please check your Shopify admin.")
+    except httpx.RequestError as e:
+        raise HTTPException(500, f"Network error connecting to Shopify API: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
