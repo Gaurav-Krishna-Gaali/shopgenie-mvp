@@ -9,11 +9,11 @@ cd backend
 if not exist .env (
     echo Creating .env file...
     (
-        echo SHOPIFY_API_KEY=55beb24f9e11b95b981622925b0ab8c8
-        echo SHOPIFY_API_SECRET=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
+        echo SHOPIFY_API_KEY=your_shopify_api_key_here
+        echo SHOPIFY_API_SECRET=your_shopify_api_secret_here
         echo APP_URL=http://localhost:8000
         echo FRONTEND_URL=http://localhost:3000
-        echo CLAUDE_API_KEY=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
+        echo CLAUDE_API_KEY=your_claude_api_key_here
         echo SESSION_SECRET=some-random-secret-string-change-in-production
     ) > .env
     echo .env file created!

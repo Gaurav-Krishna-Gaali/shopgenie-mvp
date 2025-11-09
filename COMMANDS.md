@@ -18,12 +18,12 @@ pip install -r requirements.txt
 
 Create `backend/.env` file with:
 ```
-SHOPIFY_API_KEY=55beb24f9e11b95b981622925b0ab8c8
-SHOPIFY_API_SECRET=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
+SHOPIFY_API_KEY=your_shopify_api_key_here
+SHOPIFY_API_SECRET=your_shopify_api_secret_here
 APP_URL=http://localhost:8000
 FRONTEND_URL=http://localhost:3000
-CLAUDE_API_KEY=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
-SESSION_SECRET=some-random-secret-string
+CLAUDE_API_KEY=your_claude_api_key_here
+SESSION_SECRET=some-random-secret-string-change-in-production
 ```
 
 ### 2. Frontend Setup
