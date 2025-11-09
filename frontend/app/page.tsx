@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Avatar } from "@/components/ui/avatar";
 
 export default function Home() {
   const [shop, setShop] = useState("");
@@ -22,11 +23,34 @@ export default function Home() {
   const [generatingBundle, setGeneratingBundle] = useState(false);
   const [creatingBundle, setCreatingBundle] = useState(false);
   const [agentPrompt, setAgentPrompt] = useState("");
-  const [agentMessage, setAgentMessage] = useState("Hi! I'm your AI assistant. Tell me what you'd like to do - for example, 'I want to bundle something' or 'I want to change descriptions of my products'.");
   const [activeSection, setActiveSection] = useState<string | null>(null);
-  const [chatHistory, setChatHistory] = useState<Array<{role: "user" | "assistant", content: string}>>([]);
+  const [chatHistory, setChatHistory] = useState<Array<{
+    role: "user" | "assistant";
+    content: string;
+    type?: "text" | "product_selection" | "bundle_preview";
+    products?: any[];
+    selectedProducts?: string[];
+    bundleData?: any;
+  }>>([
+    {
+      role: "assistant",
+      content: "Hi! I'm your AI assistant. What would you like to do today?",
+      type: "text"
+    }
+  ]);
   const [processingIntent, setProcessingIntent] = useState(false);
+  const [isTyping, setIsTyping] = useState(false);
+  const [currentStep, setCurrentStep] = useState<"initial" | "bundle_select_a" | "bundle_select_b" | "optimize_select" | "complete">("initial");
+  const messagesEndRef = useRef<HTMLDivElement>(null);
   const base = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:8000";
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [chatHistory, isTyping]);
 
   // Check for OAuth callback
   useEffect(() => {
@@ -213,13 +237,24 @@ export default function Home() {
     }
   };
 
+  const simulateTyping = (callback: () => void, delay: number = 1000) => {
+    setIsTyping(true);
+    setTimeout(() => {
+      setIsTyping(false);
+      callback();
+    }, delay);
+  };
+
   const handleAgentPrompt = async () => {
     if (!agentPrompt.trim() || processingIntent) return;
     
     const userMessage = agentPrompt.trim();
-    setChatHistory(prev => [...prev, { role: "user", content: userMessage }]);
+    setChatHistory(prev => [...prev, { role: "user", content: userMessage, type: "text" }]);
     setAgentPrompt("");
     setProcessingIntent(true);
+    
+    // Simulate thinking
+    setIsTyping(true);
     
     try {
       const r = await fetch(`${base}/api/agent-intent`, {
@@ -231,33 +266,177 @@ export default function Home() {
       if (!r.ok) throw new Error("Failed to process intent");
       
       const intent = await r.json();
-      setAgentMessage(intent.message);
-      setChatHistory(prev => [...prev, { role: "assistant", content: intent.message }]);
       
-      // Show the relevant section
+      // Simulate typing delay
+      await new Promise(resolve => setTimeout(resolve, 800));
+      setIsTyping(false);
+      
+      // Load products if needed
+      let currentProducts = products;
+      if (products.length === 0 && connected && (intent.show_section === "bundle" || intent.show_section === "optimize")) {
+        await loadProducts();
+        // Wait a bit for state to update
+        await new Promise(resolve => setTimeout(resolve, 100));
+        // Get fresh products from state
+        const r = await fetch(`${base}/api/products?shop=${shop}&limit=50`);
+        if (r.ok) {
+          const j = await r.json();
+          currentProducts = j.products || [];
+        }
+      }
+      
+      // Handle different intents with chain questions
       if (intent.show_section === "bundle") {
+        setCurrentStep("bundle_select_a");
         setActiveSection("bundle");
-        if (products.length === 0 && connected) {
-          await loadProducts();
-        }
+        simulateTyping(() => {
+          setChatHistory(prev => [...prev, {
+            role: "assistant",
+            content: "Great! I'll help you create a bundle. First, select Product A:",
+            type: "product_selection",
+            products: currentProducts,
+            selectedProducts: []
+          }]);
+        }, 1200);
       } else if (intent.show_section === "optimize") {
+        setCurrentStep("optimize_select");
         setActiveSection("optimize");
-        if (products.length === 0 && connected) {
-          await loadProducts();
-        }
-      } else if (intent.show_section === "products") {
-        setActiveSection("products");
-        if (products.length === 0 && connected) {
-          await loadProducts();
-        }
+        simulateTyping(() => {
+          setChatHistory(prev => [...prev, {
+            role: "assistant",
+            content: "Perfect! Which product would you like to optimize?",
+            type: "product_selection",
+            products: currentProducts,
+            selectedProducts: []
+          }]);
+        }, 1200);
       } else {
-        setActiveSection(null);
+        simulateTyping(() => {
+          setChatHistory(prev => [...prev, {
+            role: "assistant",
+            content: intent.message,
+            type: "text"
+          }]);
+        }, 800);
       }
     } catch (e: any) {
-      setAgentMessage("Sorry, I encountered an error. Please try again.");
-      setChatHistory(prev => [...prev, { role: "assistant", content: "Sorry, I encountered an error. Please try again." }]);
+      setIsTyping(false);
+      setChatHistory(prev => [...prev, {
+        role: "assistant",
+        content: "Sorry, I encountered an error. Please try again.",
+        type: "text"
+      }]);
     } finally {
       setProcessingIntent(false);
+    }
+  };
+
+  const handleProductClick = async (productId: string, product: any) => {
+    if (currentStep === "bundle_select_a") {
+      setPA(productId);
+      setChatHistory(prev => [...prev, {
+        role: "user",
+        content: product.title,
+        type: "text"
+      }]);
+      
+      setIsTyping(true);
+      setTimeout(() => {
+        setIsTyping(false);
+        setCurrentStep("bundle_select_b");
+        setChatHistory(prev => [...prev, {
+          role: "assistant",
+          content: `Great choice! Now select Product B to bundle with "${product.title}":`,
+          type: "product_selection",
+          products: products.filter(p => p.id.toString() !== productId),
+          selectedProducts: [productId]
+        }]);
+      }, 1000);
+    } else if (currentStep === "bundle_select_b") {
+      setPB(productId);
+      setChatHistory(prev => [...prev, {
+        role: "user",
+        content: product.title,
+        type: "text"
+      }]);
+      
+      setIsTyping(true);
+      setTimeout(async () => {
+        setIsTyping(false);
+        setCurrentStep("complete");
+        // Generate bundle
+        setGeneratingBundle(true);
+        try {
+          const r = await fetch(`${base}/api/generate-bundle`, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ shop, product_a_id: pA, product_b_id: productId })
+          });
+          if (r.ok) {
+            const j = await r.json();
+            setProdA(j.product_a);
+            setProdB(j.product_b);
+            setBundle(j.bundle);
+            
+            setChatHistory(prev => [...prev, {
+              role: "assistant",
+              content: "Perfect! I've generated your bundle. Here's what I created:",
+              type: "bundle_preview",
+              bundleData: {
+                bundle: j.bundle,
+                product_a: j.product_a,
+                product_b: j.product_b
+              }
+            }]);
+          }
+        } catch (e) {
+          setChatHistory(prev => [...prev, {
+            role: "assistant",
+            content: "Sorry, I couldn't generate the bundle. Please try again.",
+            type: "text"
+          }]);
+        } finally {
+          setGeneratingBundle(false);
+        }
+      }, 1500);
+    } else if (currentStep === "optimize_select") {
+      setSelected(productId);
+      setChatHistory(prev => [...prev, {
+        role: "user",
+        content: product.title,
+        type: "text"
+      }]);
+      
+      setIsTyping(true);
+      setTimeout(async () => {
+        setIsTyping(false);
+        setCurrentStep("complete");
+        setLoading(true);
+        try {
+          const r = await fetch(`${base}/api/generate`, {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({ shop, product_id: productId })
+          });
+          if (r.ok) {
+            const j = await r.json();
+            setSuggestion(j.suggestion);
+            setChatHistory(prev => [...prev, {
+              role: "assistant",
+              content: "I've generated optimized launch assets for your product! Check the preview below.",
+              type: "text"
+            }]);
+          }
+        } catch (e) {
+          setChatHistory(prev => [...prev, {
+            role: "assistant",
+            content: "Sorry, I couldn't generate the assets. Please try again.",
+            type: "text"
+          }]);
+        } finally {
+          setLoading(false);
+        }
+      }, 1500);
     }
   };
 
@@ -272,79 +451,202 @@ export default function Home() {
         <p className="text-muted-foreground mt-2 text-lg">Your intelligent assistant for Shopify product optimization</p>
       </div>
 
-      {/* Agent Chat Interface */}
+      {/* Chat Interface */}
       {connected && (
-        <Card className="border-2 border-primary/20 bg-gradient-to-br from-card to-card/50 backdrop-blur-sm">
-          <CardHeader>
-            <div className="flex items-start gap-3">
-              <div className="w-10 h-10 rounded-full bg-gradient-to-br from-primary via-purple-500 to-blue-500 flex items-center justify-center text-white font-bold text-sm shadow-lg">
-                AI
-              </div>
-              <div className="flex-1">
-                <CardTitle className="text-xl mb-2">AI Assistant</CardTitle>
-                <CardDescription className="text-base whitespace-pre-line text-foreground/90">
-                  {agentMessage}
-                </CardDescription>
+        <Card className="border-2 border-primary/20 h-[600px] flex flex-col">
+          <CardHeader className="border-b border-border">
+            <div className="flex items-center gap-3">
+              <Avatar className="bg-gradient-to-br from-primary via-purple-500 to-blue-500">
+                <span className="text-white font-bold">AI</span>
+              </Avatar>
+              <div>
+                <CardTitle className="text-lg">AI Assistant</CardTitle>
+                <CardDescription>Always here to help</CardDescription>
               </div>
             </div>
           </CardHeader>
-          <CardContent className="space-y-4">
+          <CardContent className="flex-1 overflow-y-auto p-4 space-y-4">
+            {chatHistory.map((message, idx) => (
+              <div
+                key={idx}
+                className={`flex gap-3 ${message.role === "user" ? "justify-end" : "justify-start"}`}
+              >
+                {message.role === "assistant" && (
+                  <Avatar className="bg-gradient-to-br from-primary via-purple-500 to-blue-500 shrink-0">
+                    <span className="text-white font-bold text-xs">AI</span>
+                  </Avatar>
+                )}
+                <div className={`flex flex-col gap-2 max-w-[75%] ${message.role === "user" ? "items-end" : "items-start"}`}>
+                  <div
+                    className={`rounded-2xl px-4 py-2 ${
+                      message.role === "user"
+                        ? "bg-primary text-primary-foreground rounded-br-sm"
+                        : "bg-muted text-foreground rounded-bl-sm"
+                    }`}
+                  >
+                    <p className="text-sm whitespace-pre-wrap">{message.content}</p>
+                  </div>
+                  
+                  {/* Product Selection UI */}
+                  {message.type === "product_selection" && message.products && (
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 w-full mt-2">
+                      {message.products.map((p: any) => {
+                        const imageUrl = p.images?.[0]?.src || '/placeholder.png';
+                        const isSelected = message.selectedProducts?.includes(p.id.toString());
+                        return (
+                          <div
+                            key={p.id}
+                            onClick={() => !isSelected && handleProductClick(p.id.toString(), p)}
+                            className={`border-2 rounded-lg overflow-hidden cursor-pointer transition-all ${
+                              isSelected
+                                ? 'border-primary bg-primary/10 opacity-50 cursor-not-allowed'
+                                : 'border-border bg-card hover:border-primary/50 hover:shadow-lg'
+                            }`}
+                          >
+                            <img
+                              src={imageUrl}
+                              alt={p.title}
+                              className="w-full h-20 object-cover"
+                            />
+                            <div className="p-2">
+                              <p className="text-xs font-medium text-center line-clamp-2 text-foreground">{p.title}</p>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  
+                  {/* Bundle Preview */}
+                  {message.type === "bundle_preview" && message.bundleData && (
+                    <Card className="w-full mt-2 border-primary/20">
+                      <CardHeader>
+                        <CardTitle className="text-lg">{message.bundleData.bundle.title}</CardTitle>
+                      </CardHeader>
+                      <CardContent className="space-y-3">
+                        <div className="prose prose-sm max-w-none prose-invert" dangerouslySetInnerHTML={{__html: message.bundleData.bundle.description_html}} />
+                        <div className="space-y-1 text-sm">
+                          <p><b className="text-muted-foreground">Tags:</b> {message.bundleData.bundle.tags}</p>
+                          <p><b className="text-muted-foreground">Discount:</b> {message.bundleData.bundle.bundle_price_percent_off}% off</p>
+                          <p><b className="text-muted-foreground">Notes:</b> {message.bundleData.bundle.bundle_notes}</p>
+                        </div>
+                        <Button
+                          className="w-full bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 mt-3"
+                          onClick={async () => {
+                            setCreatingBundle(true);
+                            try {
+                              const r = await fetch(`${base}/api/create-bundle`, {
+                                method: "POST",
+                                headers: {"Content-Type":"application/json"},
+                                body: JSON.stringify({
+                                  shop,
+                                  product_a: message.bundleData.product_a,
+                                  product_b: message.bundleData.product_b,
+                                  bundle: message.bundleData.bundle
+                                })
+                              });
+                              if (r.ok) {
+                                setChatHistory(prev => [...prev, {
+                                  role: "assistant",
+                                  content: "✅ Bundle created successfully in your store! You can view it in your Shopify admin.",
+                                  type: "text"
+                                }]);
+                                // Reset bundle state
+                                setBundle(null);
+                                setProdA(null);
+                                setProdB(null);
+                                setPA("");
+                                setPB("");
+                                setCurrentStep("initial");
+                              } else {
+                                const errorData = await r.json().catch(() => ({ detail: r.statusText }));
+                                const errorMsg = errorData.detail || errorData.message || r.statusText;
+                                setChatHistory(prev => [...prev, {
+                                  role: "assistant",
+                                  content: `❌ Failed to create bundle: ${errorMsg}`,
+                                  type: "text"
+                                }]);
+                              }
+                            } catch (e: any) {
+                              setChatHistory(prev => [...prev, {
+                                role: "assistant",
+                                content: `❌ Failed to create bundle: ${e.message || "Unknown error"}`,
+                                type: "text"
+                              }]);
+                            } finally {
+                              setCreatingBundle(false);
+                            }
+                          }}
+                          disabled={creatingBundle}
+                        >
+                          {creatingBundle ? "Creating..." : "Create Bundle in Store"}
+                        </Button>
+                      </CardContent>
+                    </Card>
+                  )}
+                </div>
+                {message.role === "user" && (
+                  <Avatar className="bg-secondary shrink-0">
+                    <span className="text-secondary-foreground font-bold text-xs">You</span>
+                  </Avatar>
+                )}
+              </div>
+            ))}
+            
+            {/* Typing Indicator */}
+            {isTyping && (
+              <div className="flex gap-3 justify-start animate-in fade-in slide-in-from-left-2 duration-300">
+                <Avatar className="bg-gradient-to-br from-primary via-purple-500 to-blue-500 shrink-0 relative">
+                  <span className="text-white font-bold text-xs relative z-10">AI</span>
+                  <div className="absolute inset-0 bg-gradient-to-br from-primary via-purple-500 to-blue-500 rounded-full animate-ping opacity-20"></div>
+                </Avatar>
+                <div className="bg-muted/80 backdrop-blur-sm rounded-2xl rounded-bl-sm px-5 py-3 shadow-lg border border-primary/20 relative overflow-hidden">
+                  {/* Animated background gradient */}
+                  <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-purple-500/5 to-blue-500/5 animate-pulse"></div>
+                  
+                  <div className="flex items-center gap-3 relative z-10">
+                    <span className="text-xs text-muted-foreground font-medium">AI is thinking</span>
+                    <div className="flex gap-1.5 items-center">
+                      <div className="w-2.5 h-2.5 bg-gradient-to-br from-primary to-purple-500 rounded-full typing-dot shadow-sm"></div>
+                      <div className="w-2.5 h-2.5 bg-gradient-to-br from-purple-500 to-blue-500 rounded-full typing-dot shadow-sm"></div>
+                      <div className="w-2.5 h-2.5 bg-gradient-to-br from-blue-500 to-primary rounded-full typing-dot shadow-sm"></div>
+                    </div>
+                    {/* Sparkle effect */}
+                    <div className="flex gap-1">
+                      <svg className="w-3 h-3 text-primary animate-pulse" style={{ animationDelay: '0ms' }} fill="currentColor" viewBox="0 0 20 20">
+                        <path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z" />
+                      </svg>
+                      <svg className="w-2.5 h-2.5 text-purple-500 animate-pulse" style={{ animationDelay: '300ms' }} fill="currentColor" viewBox="0 0 20 20">
+                        <path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z" />
+                      </svg>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+            
+            <div ref={messagesEndRef} />
+          </CardContent>
+          <div className="border-t border-border p-4">
             <div className="flex gap-2">
               <Input
                 type="text"
                 value={agentPrompt}
                 onChange={(e) => setAgentPrompt(e.target.value)}
-                onKeyPress={(e) => e.key === "Enter" && handleAgentPrompt()}
-                placeholder="Tell me what you'd like to do... (e.g., 'I want to bundle something')"
-                disabled={processingIntent}
+                onKeyPress={(e) => e.key === "Enter" && !processingIntent && handleAgentPrompt()}
+                placeholder="Type your message..."
+                disabled={processingIntent || isTyping}
                 className="flex-1"
               />
               <Button
                 onClick={handleAgentPrompt}
-                disabled={!agentPrompt.trim() || processingIntent}
-                className="bg-gradient-to-r from-primary to-purple-600 hover:from-primary/90 hover:to-purple-600/90 shadow-lg"
+                disabled={!agentPrompt.trim() || processingIntent || isTyping}
+                className="bg-gradient-to-r from-primary to-purple-600 hover:from-primary/90 hover:to-purple-600/90"
               >
                 {processingIntent ? "..." : "Send"}
               </Button>
             </div>
-
-            {/* Quick Actions */}
-            <div className="flex gap-2 flex-wrap">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  setAgentPrompt("I want to bundle something");
-                  handleAgentPrompt();
-                }}
-                className="text-xs"
-              >
-                Create Bundle
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  setAgentPrompt("I want to change descriptions of my products");
-                  handleAgentPrompt();
-                }}
-                className="text-xs"
-              >
-                Optimize Descriptions
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  setAgentPrompt("Show me my products");
-                  handleAgentPrompt();
-                }}
-                className="text-xs"
-              >
-                View Products
-              </Button>
-            </div>
-          </CardContent>
+          </div>
         </Card>
       )}
 
@@ -634,7 +936,8 @@ export default function Home() {
         </Card>
       )}
 
-      {bundle && prodA && prodB && (
+      {/* Hide separate bundle preview when bundle is shown in chat */}
+      {bundle && prodA && prodB && !chatHistory.some(m => m.type === "bundle_preview") && (
         <Card className="border-2 border-primary/20">
           <CardHeader>
             <CardTitle className="text-2xl">{bundle.title}</CardTitle>
